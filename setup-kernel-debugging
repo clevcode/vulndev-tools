@@ -1,0 +1,272 @@
+#!/bin/bash
+#
+# Copyright (C) Joel Eriksson <je@clevcode.org> 2020
+#
+# Helper script for automated Linux kernel debugging environment setup.
+#
+# This script uses multipass (https://multipass.run/) to set up the initial VM.
+#
+# It will assume that you have installed multipass using "snap install multipass",
+# and that /var/snap/multipass/common/data/multipassd/vault/instances is the path
+# where instances are stored. Otherwise, change the "base_path" variable below.
+#
+# It also depends on QEMU (specifically, qemu-system-x86_64), GDB and tmux being
+# available on the host system.
+#
+# Multipass uses QEMU in the backend by default, which is what we use to set up
+# kernel debugging later, and it would be possible to eliminate the multipass
+# dependency with some work. We would need to manually create the cloud-init
+# configuration ISO, and either use QEMUs built-in DHCP server functionality or
+# run a separate DHCP server on the side (like multipass does).
+#
+# For now, this is adapted for setting up Ubuntu based VMs, but it would be
+# possible to make versions of this script (or add command line flags) to allow
+# it to be used for setting up kernel-debugging environments for other Linux
+# distributions as well, as long as there are cloud-init based images available.
+#
+# Note that the multipass VM currently keep running in the background after
+# this script has finished executing, feel free to stop and delete it in case it
+# is not needed though. In that case, run:
+#
+#   multipass stop <name> && multipass delete <name> && multipass purge
+#
+# If you make changes to the multipass VM, and want to update the image that is
+# used for debugging, you can simply copy the image from <base_path>/<name>/...
+# to <name>/qemu.img after you have made the changes you need.
+#
+# Note that right now the default GDB server port (1234) is used. If we want to
+# run multiple kernel debugging sessions in parallell, we need to make this
+# adjustable (i.e. change "-s" in the qemu command line to "-gdb tcp::PORT",
+# and change "target remote :1234" in the gdb command line to "target remote
+# :PORT", in the scripts that are generated).
+
+# The path where Multipass instance data is stored. The below is the default
+# path used after installing multipass via Snap on Ubuntu, so you might need
+# to change this for your system.
+#
+# Alternatively, we could just automatically extract the path from the
+# ps-output when multipass is running...
+base_path=/var/snap/multipass/common/data/multipassd/vault/instances
+
+# Exit script immediately if any command fails
+set -e
+
+# IMAGE may be the name of one of the built-in images, or an URL to an image
+# NAME is the name of the VM to create, and is optional
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 IMAGE [NAME]" >&2
+    exit 1
+fi
+
+image="$1"
+
+# Default number of cores, RAM and disk space
+cores=1
+memory=1G
+
+# Since we download the Linux kernel source we need some extra space.
+# This is probably more than necessary... But, better safe than sorry.
+disk=15G
+
+if [ $# -ge 2 ]; then
+    vmname="$2"
+else
+    vmname="vm$$"
+fi
+
+#############################################################################
+# Launch VM
+
+multipass_args=(
+    launch
+    -n "$vmname"
+    -c "$cores"
+    -m "$memory"
+    -d "$disk"
+    "$image"
+)
+
+echo "[+] Launching VM..." >&2
+multipass "${multipass_args[@]}"
+
+mkdir "$vmname"
+vmpath="$base_path/$vmname"
+
+# Find the name of the image
+vmfile=$(find "$vmpath" -type f ! -name cloud-init-config.iso)
+
+#############################################################################
+# Update system
+
+echo "[+] Updating system..." >&2
+multipass exec "$vmname" -- bash -c '
+    sudo apt -y update && \
+    sudo apt -y upgrade && \
+    sudo apt -y dist-upgrade
+'
+
+#############################################################################
+# Reboot system
+
+echo "[+] Rebooting..." >&2
+multipass restart "$vmname"
+
+# A sleep was needed for Ubuntu 14.04, but not for 16.04, 18.04 and 20.04
+# Need a better way to determine if the VM is available again or not...
+sleep 10
+
+#############################################################################
+# Copy the QEMU image now, after the target kernel has been installed
+
+cp "$vmfile" "$vmname"/qemu.img
+
+#############################################################################
+# Get vmlinux with debug symbols & current kernel source
+
+echo "[+] Install debug symbols repository..." >&2
+multipass exec "$vmname" -- bash -c '
+    components="main restricted universe multiverse"
+    repo="http://ddebs.ubuntu.com"
+    keyid="C8CAB6595FDFF622"
+    (
+        echo "deb $repo $(lsb_release -cs)-updates $components"
+        echo "deb $repo $(lsb_release -cs)-proposed $components"
+    ) | sudo tee -a /etc/apt/sources.list.d/ddebs.list
+    sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys "$keyid"
+    sudo perl -i -pne "s/^# deb-src/deb-src/" /etc/apt/sources.list
+    sudo apt-get -y update
+    sudo apt-get -y install linux-image-$(uname -r)-dbgsym
+    sudo apt-get -y install dpkg-dev
+    mkdir src
+    cd src
+    echo "[+] Retreiving kernel source..." >&2
+    apt-get -qq source linux-image-unsigned-$(uname -r)
+'
+
+#############################################################################
+# Copy vmlinuz, vmlinux and initrd
+
+echo "[+] Copying vmlinuz, vmlinux and initrd..." >&2
+
+multipass exec "$vmname" -- \
+    sudo bash -c 'cat /boot/vmlinuz-$(uname -r)' \
+    > "$vmname/vmlinuz"
+
+multipass exec "$vmname" -- \
+    sudo bash -c 'cat /usr/lib/debug/boot/vmlinux-$(uname -r)' \
+    > "$vmname/vmlinux"
+
+multipass exec "$vmname" -- \
+    sudo bash -c 'cat /boot/init*-$(uname -r){,.img} 2>/dev/null || true' \
+    > "$vmname/initrd"
+
+#############################################################################
+# Copying kernel source
+
+echo "[+] Copying kernel source from VM to host..." >&2
+
+multipass exec "$vmname" -- \
+    tar cf - src | tar -C "$vmname" -xf -
+
+#############################################################################
+# Extract boot parameters from GRUB configuration
+
+echo "[+] Extracting boot parameters from GRUB configuration..." >&2
+
+args=$(
+    multipass exec "$vmname" -- \
+        sudo bash -c '
+        boot_args="$(
+            grep /boot/vmlinuz-$(uname -r) /boot/grub/grub.cfg \
+            | head -n1 | awk "{\$1=\$2=\"\"; print \$0}" | tr -s " "
+        )"
+        args=${boot_args%% }
+        args=${boot_args## }
+        echo "$args"
+        '
+)
+
+#############################################################################
+# Creating emu script
+
+echo "[+] Creating script to start VM..." >&2
+
+cat<<EOF>"$vmname/emu"
+#!/bin/bash
+
+basedir="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd -P)"
+
+opts=(
+    --enable-kvm
+
+    -s
+
+    -smp 4
+    -m 2048M
+    -cpu host
+    -nographic
+
+    -drive file="\$basedir/qemu.img",if=none,format=qcow2,discard=unmap,id=hda
+    -device virtio-scsi-pci,id=scsi0
+    -device scsi-hd,drive=hda,bus=scsi0.0
+
+    -kernel "\$basedir/vmlinuz"
+    -initrd "\$basedir/initrd"
+    -append "$args nokaslr rw init=/bin/bash"
+)
+
+exec qemu-system-x86_64 "\${opts[@]}"
+EOF
+
+chmod 755 "$vmname/emu"
+
+#############################################################################
+# Creating dbg script
+
+echo "[+] Creating script to start kernel debugger..." >&2
+
+cat<<'EOF'>"$vmname/dbg"
+#!/bin/bash
+
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+subst_path="$(
+    strings vmlinux \
+    | grep ^/build/linux- | head -n1 | cut -d/ -f1-4
+)"
+src_path=$(echo $(pwd)/src/linux-*)
+
+exec gdb -q vmlinux \
+    -ex "set substitute-path $subst_path $src_path" \
+    -ex 'target remote :1234'
+EOF
+
+chmod 755 "$vmname/dbg"
+
+#############################################################################
+# Creating run script
+
+echo "[+] Creating script to run VM and kernel debugger in tmux..." >&2
+
+cat<<'EOF'>"$vmname/run"
+#!/bin/bash
+
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+exec tmux new-session   \; \
+send-keys ./emu Enter   \; \
+split-window -v         \; \
+send-keys               \
+"sleep 1" Enter         \
+./dbg Enter
+EOF
+
+chmod 755 "$vmname/run"
+
+echo "[+] Done!" >&2
+ls -l "$vmname"
+
+echo "Starting $vmname/run..." >&2
+sleep 5
+
+exec "$vmname/run"
