@@ -40,7 +40,7 @@ Example usage:
 ```
 
 The second argument (i.e. "dev" in the examples above) is just the name to use
-for the VM, and the directory where the files for the VM as well as the scripts
+for the VM, and the directory where the files for the VM, as well as the scripts
 to run it, will be placed.
 
 Read the source.
