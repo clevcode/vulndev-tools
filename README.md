@@ -8,6 +8,12 @@ a kernel debugging environment.
 
 Dependencies: Multipass (https://multipass.run), QEMU, GDB and tmux.
 
+To install dependencies under Ubuntu:
+```bash
+sudo snap install multipass
+sudo apt-get -y install qemu-system-x86 gdb tmux
+```
+
 Pull requests are welcome. Examples of features to add:
 
  Add getopts-based command line argument handling.
