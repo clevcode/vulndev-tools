@@ -16,7 +16,7 @@ sudo apt-get -y install qemu-system-x86 gdb tmux
 
 Pull requests are welcome. Examples of features to add:
 
- Add getopts-based command line argument handling.
+- Add getopts-based command line argument handling.
 - Add option for making system update-step optional.
 - Add option for specifying a specific kernel to install.
 - Add support for non-Ubuntu-based guests. For instance, CentOS: https://cloud.centos.org/centos/8/x86_64/images/CentOS-8-GenericCloud-8.2.2004-20200611.2.x86_64.qcow2
