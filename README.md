@@ -35,7 +35,7 @@ Example usage:
 
 # The same as above, but with a specific "cloud image" URL
 ./setup-kernel-debugging \
-  https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img
+  https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img \
   dev
 ```
 
